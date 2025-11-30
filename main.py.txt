@@ -1,0 +1,230 @@
+# main.py
+import os
+import json
+import logging
+import time
+from pathlib import Path
+from datetime import datetime
+from telegram import Update, Message
+from telegram.ext import Updater, MessageHandler, Filters, CallbackContext, CommandHandler
+
+# --------------- KEEP-ALIVE SERVER ---------------
+from flask import Flask
+from threading import Thread
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run_keepalive():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run_keepalive)
+    t.start()
+
+# -------------------------------------------------
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Environment variables
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+GROUP_CHAT_ID = os.environ.get("GROUP_CHAT_ID")  # put your group's chat id here (negative for groups)
+if not BOT_TOKEN or not GROUP_CHAT_ID:
+    raise SystemExit("Missing BOT_TOKEN or GROUP_CHAT_ID environment variable")
+GROUP_CHAT_ID = int(GROUP_CHAT_ID)
+
+# Files for persistent maps/buffer (created in same dir)
+MAP_PATH = Path("user_map.json")     # maps admin_group_message_id -> user_chat_id
+BUFFER_PATH = Path("buffer.json")   # list of buffered messages while sleeping
+
+if not MAP_PATH.exists():
+    MAP_PATH.write_text("{}")
+if not BUFFER_PATH.exists():
+    BUFFER_PATH.write_text("[]")
+
+def load_map():
+    try:
+        return json.loads(MAP_PATH.read_text())
+    except Exception:
+        return {}
+
+def save_map(m):
+    MAP_PATH.write_text(json.dumps(m))
+
+def load_buffer():
+    try:
+        return json.loads(BUFFER_PATH.read_text())
+    except Exception:
+        return []
+
+def save_buffer(buf):
+    BUFFER_PATH.write_text(json.dumps(buf))
+
+user_map = load_map()  # string(message_id) -> int(user_chat_id)
+
+# ----------------- Helpers -----------------
+def sender_info_text(message: Message) -> str:
+    u = message.from_user
+    full_name = u.full_name or (u.first_name or "Unknown")
+    username = f"@{u.username}" if u.username else "No username"
+    return f"From: {full_name} ({username})\nChat ID: {message.chat.id}"
+
+def buffer_message_entry(message: Message) -> dict:
+    """Create a JSON-serializable buffer entry for this incoming message."""
+    entry = {
+        "user_chat_id": message.chat.id,
+        "message_id": message.message_id,
+        "has_media": False,
+        "text": None
+    }
+    if message.text:
+        entry["has_media"] = False
+        entry["text"] = message.text
+    else:
+        entry["has_media"] = True
+    return entry
+
+# ----------------- Handlers -----------------
+def start_handler(update: Update, context: CallbackContext):
+    update.message.reply_text("Hello — send a message and it will be forwarded to the admin group.")
+
+def handle_user_message(update: Update, context: CallbackContext):
+    """Called when a user sends a message to the bot."""
+    msg = update.message
+    user_chat_id = msg.chat.id
+
+    header = sender_info_text(msg)
+
+    try:
+        if msg.text and not (msg.photo or msg.document or msg.video or msg.sticker or msg.voice or msg.audio):
+            text_to_send = f"{header}\n\n{msg.text}"
+            sent = context.bot.send_message(chat_id=GROUP_CHAT_ID, text=text_to_send)
+            user_map[str(sent.message_id)] = user_chat_id
+            save_map(user_map)
+            msg.reply_text("Your message has been delivered to the admin group.")
+        else:
+            sent_header = context.bot.send_message(chat_id=GROUP_CHAT_ID, text=header)
+            forwarded = context.bot.forward_message(
+                chat_id=GROUP_CHAT_ID,
+                from_chat_id=user_chat_id,
+                message_id=msg.message_id
+            )
+            user_map[str(sent_header.message_id)] = user_chat_id
+            user_map[str(forwarded.message_id)] = user_chat_id
+            save_map(user_map)
+            msg.reply_text("Your message has been delivered to the admin group.")
+    except Exception as e:
+        logger.info(f"Buffering message from {user_chat_id} because of exception: {e}")
+        buf = load_buffer()
+        buf.append(buffer_message_entry(msg))
+        save_buffer(buf)
+        try:
+            msg.reply_text("Bot is temporarily offline. Your message will be delivered when the bot wakes up.")
+        except Exception:
+            pass
+
+def handle_admin_reply(update: Update, context: CallbackContext):
+    msg = update.message
+    if msg.chat.id != GROUP_CHAT_ID:
+        return
+
+    if not msg.reply_to_message:
+        return
+
+    replied_id = str(msg.reply_to_message.message_id)
+    if replied_id not in user_map:
+        context.bot.send_message(chat_id=GROUP_CHAT_ID, text="Cannot identify original sender for this reply.")
+        return
+
+    target_chat_id = user_map[replied_id]
+
+    try:
+        if msg.text:
+            context.bot.send_message(chat_id=target_chat_id, text=msg.text)
+        else:
+            context.bot.forward_message(chat_id=target_chat_id, from_chat_id=GROUP_CHAT_ID, message_id=msg.message_id)
+    except Exception as e:
+        logger.error(f"Failed to deliver admin reply to {target_chat_id}: {e}")
+        try:
+            context.bot.send_message(chat_id=GROUP_CHAT_ID, text=f"Failed to send reply to user {target_chat_id}.")
+        except Exception:
+            pass
+
+# ----------------- Buffer delivery -----------------
+def deliver_buffered_messages(bot):
+    buf = load_buffer()
+    if not buf:
+        return
+
+    logger.info(f"Delivering {len(buf)} buffered messages...")
+    changed = False
+    for entry in buf:
+        try:
+            user_chat_id = entry["user_chat_id"]
+            orig_msg_id = entry["message_id"]
+            header_text = f"Buffered message from Chat ID: {user_chat_id}"
+            if not entry.get("has_media", False):
+                text = entry.get("text") or "[no text]"
+                sent = bot.send_message(chat_id=GROUP_CHAT_ID, text=f"{header_text}\n\n{text}")
+                user_map[str(sent.message_id)] = user_chat_id
+                changed = True
+            else:
+                sent_header = bot.send_message(chat_id=GROUP_CHAT_ID, text=header_text)
+                forwarded = bot.forward_message(chat_id=GROUP_CHAT_ID, from_chat_id=user_chat_id, message_id=orig_msg_id)
+                user_map[str(sent_header.message_id)] = user_chat_id
+                user_map[str(forwarded.message_id)] = user_chat_id
+                changed = True
+        except Exception as e:
+            logger.warning(f"Failed to deliver buffered message {entry}: {e}")
+
+    save_buffer([])
+    if changed:
+        save_map(user_map)
+    logger.info("Buffered delivery completed.")
+
+# ----------------- Scheduling -----------------
+def is_active_hours():
+    now = datetime.now()
+    if now.weekday() == 6:  # Sunday
+        return False
+    return 8 <= now.hour < 24
+
+def main():
+    updater = Updater(BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("start", start_handler))
+    dp.add_handler(MessageHandler(Filters.chat_type.private & ~Filters.user(GROUP_CHAT_ID), handle_user_message))
+    dp.add_handler(MessageHandler(Filters.chat_type.groups & Filters.user(GROUP_CHAT_ID), handle_admin_reply))
+    dp.add_handler(MessageHandler(Filters.chat(GROUP_CHAT_ID) & Filters.reply, handle_admin_reply))
+
+    while True:
+        if is_active_hours():
+            logger.info("Active hours: starting polling and delivering buffered messages...")
+            updater.start_polling()
+
+            try:
+                deliver_buffered_messages(updater.bot)
+            except Exception as e:
+                logger.warning(f"deliver_buffered_messages error: {e}")
+
+            while is_active_hours():
+                time.sleep(60)
+
+            logger.info("Active window ended: stopping polling...")
+            updater.stop()
+        else:
+            logger.info("Sleeping (off-hours/Sunday). Will check again in 5 minutes.")
+            time.sleep(300)
+
+# ----------------- START BOT -----------------
+if __name__ == "__main__":
+    keep_alive()   # <-- ADDED FOR REPLIT
+    main()
